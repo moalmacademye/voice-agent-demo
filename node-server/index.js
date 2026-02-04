@@ -14,30 +14,7 @@ if (!OPENAI_API_KEY) {
 
 const PORT = process.env.PORT || 3000;
 
-const wss = new WebSocketServer({ port: PORT });
-
-wss.on("connection", async (ws, req) => {
-  if (!req.url) {
-    console.log("No URL provided, closing connection.");
-    ws.close();
-    return;
-  }
-
-  const url = new URL(req.url, `https://${req.headers.host}`);
-  const pathname = url.pathname;
-
-  if (pathname !== "/") {
-    console.log(`Invalid pathname: "${pathname}"`);
-    ws.close();
-    return;
-  }
-
-  const client = new RealtimeClient({ apiKey: OPENAI_API_KEY });
-
-  let sessionConfigured = false;
-  const pendingMessages = [];
-
-  const SYSTEM_PROMPT = `أنت "سارة"، مسؤولة التوظيف الذكية في شركة فاركو للأدوية (Pharco Pharmaceuticals) - واحدة من أكبر شركات الأدوية في مصر.
+const SYSTEM_PROMPT = `أنت "سارة"، مسؤولة التوظيف الذكية في شركة فاركو للأدوية (Pharco Pharmaceuticals) - واحدة من أكبر شركات الأدوية في مصر.
 
 ## دورك:
 أنتِ بتعملي مقابلة شخصية مبدئية (Screening Interview) مع المتقدمين للوظائف في فاركو. هدفك تقيمي المرشح بشكل مهني ولطيف.
@@ -67,53 +44,94 @@ wss.on("connection", async (ws, req) => {
 
 ابدأي بالترحيب بالمرشح.`;
 
+const wss = new WebSocketServer({ port: PORT });
+
+wss.on("connection", async (ws, req) => {
+  if (!req.url) {
+    console.log("No URL provided, closing connection.");
+    ws.close();
+    return;
+  }
+
+  const url = new URL(req.url, `https://${req.headers.host}`);
+  const pathname = url.pathname;
+
+  if (pathname !== "/") {
+    console.log(`Invalid pathname: "${pathname}"`);
+    ws.close();
+    return;
+  }
+
+  const client = new RealtimeClient({ apiKey: OPENAI_API_KEY });
+
+  // Track state
+  let initialGreetingSent = false;
+  let clientInitialEventsDone = false;
+
   // Relay: OpenAI Realtime API Event -> Browser Event
   client.realtime.on("server.*", (event) => {
-    // Track when our session config is applied
-    if (event.type === "session.updated") {
-      sessionConfigured = true;
-      // Flush any pending messages
-      while (pendingMessages.length) {
-        const pendingEvent = pendingMessages.shift();
-        console.log(`Flushing pending "${pendingEvent.type}" to OpenAI`);
-        client.realtime.send(pendingEvent.type, pendingEvent);
-      }
+
+    // When OUR server session config is confirmed, trigger the greeting
+    if (event.type === "session.updated" && !initialGreetingSent) {
+      initialGreetingSent = true;
+      console.log(`>>> Session configured with audio! Sending initial greeting...`);
+
+      // Tell OpenAI to generate the greeting using the system prompt
+      client.realtime.send("response.create", {
+        response: {
+          modalities: ["text", "audio"],
+        },
+      });
+      console.log(`>>> Sent response.create for initial greeting`);
     }
-    console.log(`Relaying "${event.type}" to Client`);
+
+    // Log important events (skip noisy audio delta)
+    if (event.type !== "response.audio.delta") {
+      console.log(`Relaying "${event.type}" to Client`);
+    }
+
     ws.send(JSON.stringify(event));
   });
 
   client.realtime.on("close", () => ws.close());
 
   // Relay: Browser Event -> OpenAI Realtime API Event
-  const messageQueue = [];
+  const preConnectQueue = [];
 
   const messageHandler = (data) => {
     try {
       const event = JSON.parse(data);
 
-      // INTERCEPT: Force audio modalities on ALL session updates
+      // DROP the client's initial session.update, conversation.item.create, response.create
+      // Server handles the entire initial setup
+      if (!clientInitialEventsDone) {
+        if (
+          event.type === "session.update" ||
+          event.type === "conversation.item.create" ||
+          event.type === "response.create"
+        ) {
+          console.log(`Dropping client initial "${event.type}" (server handles this)`);
+
+          // After we see the client's response.create, initial phase is over
+          if (event.type === "response.create") {
+            clientInitialEventsDone = true;
+            console.log(`>>> Client initial events phase complete. Now relaying normally.`);
+          }
+          return;
+        }
+      }
+
+      // For any later session.update from client, force audio + prompt
       if (event.type === "session.update") {
         event.session = event.session || {};
         event.session.modalities = ["text", "audio"];
         event.session.voice = event.session.voice || "shimmer";
-        event.session.instructions = event.session.instructions || SYSTEM_PROMPT;
+        event.session.instructions = SYSTEM_PROMPT;
         event.session.input_audio_transcription = { model: "whisper-1" };
         event.session.turn_detection = { type: "server_vad" };
-        console.log(`Forced audio modalities on session.update`);
-        // Session updates go through immediately
-        client.realtime.send(event.type, event);
-        return;
+        console.log(`Forced audio modalities on later client session.update`);
       }
 
-      // QUEUE: Hold conversation.item.create and response.create until session is ready
-      if (!sessionConfigured && (event.type === "conversation.item.create" || event.type === "response.create")) {
-        console.log(`Queuing "${event.type}" until session is configured`);
-        pendingMessages.push(event);
-        return;
-      }
-
-      console.log(`Relaying "${event.type}" to OpenAI`);
       client.realtime.send(event.type, event);
     } catch (e) {
       console.error(e.message);
@@ -123,7 +141,7 @@ wss.on("connection", async (ws, req) => {
 
   ws.on("message", (data) => {
     if (!client.isConnected()) {
-      messageQueue.push(data);
+      preConnectQueue.push(data);
     } else {
       messageHandler(data);
     }
@@ -143,7 +161,7 @@ wss.on("connection", async (ws, req) => {
 
   console.log(`Connected to OpenAI successfully!`);
 
-  // Send server-side session configuration with system prompt
+  // SERVER controls session config - send it immediately
   client.realtime.send("session.update", {
     session: {
       modalities: ["text", "audio"],
@@ -153,11 +171,11 @@ wss.on("connection", async (ws, req) => {
       turn_detection: { type: "server_vad" },
     },
   });
-  console.log("Sent server-side session config with Pharco interviewer prompt");
+  console.log(">>> Sent server-side session config with Pharco interviewer prompt");
 
-  // Flush pre-connection queue
-  while (messageQueue.length) {
-    messageHandler(messageQueue.shift());
+  // Process any messages that arrived before connection
+  while (preConnectQueue.length) {
+    messageHandler(preConnectQueue.shift());
   }
 });
 
