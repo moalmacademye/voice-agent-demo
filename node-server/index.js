@@ -62,32 +62,68 @@ wss.on("connection", async (ws, req) => {
     return;
   }
 
+  // Use RealtimeClient with built-in session management
   const client = new RealtimeClient({ apiKey: OPENAI_API_KEY });
 
-  // Track state
   let initialGreetingSent = false;
-  let clientInitialEventsDone = false;
+  let clientInitDone = false;
 
-  // Relay: OpenAI Realtime API Event -> Browser Event
+  // ===== OpenAI -> Browser relay =====
   client.realtime.on("server.*", (event) => {
-
-    // When OUR server session config is confirmed, trigger the greeting
-    if (event.type === "session.updated" && !initialGreetingSent) {
-      initialGreetingSent = true;
-      console.log(`>>> Session configured with audio! Sending initial greeting...`);
-
-      // Tell OpenAI to generate the greeting using the system prompt
-      client.realtime.send("response.create", {
-        response: {
-          modalities: ["text", "audio"],
-        },
-      });
-      console.log(`>>> Sent response.create for initial greeting`);
+    // DEBUG: Log full content of key events
+    if (event.type === "session.created") {
+      console.log(`[DEBUG] session.created - default session:`, JSON.stringify(event.session?.modalities));
+    }
+    if (event.type === "session.updated") {
+      console.log(`[DEBUG] session.updated - modalities:`, JSON.stringify(event.session?.modalities));
+      console.log(`[DEBUG] session.updated - voice:`, event.session?.voice);
+      console.log(`[DEBUG] session.updated - turn_detection:`, JSON.stringify(event.session?.turn_detection));
+      console.log(`[DEBUG] session.updated - has instructions:`, !!event.session?.instructions);
+    }
+    if (event.type === "response.done") {
+      const status = event.response?.status;
+      const output = event.response?.output;
+      console.log(`[DEBUG] response.done - status: ${status}, output count: ${output?.length}`);
+      if (output && output.length > 0) {
+        output.forEach((item, i) => {
+          console.log(`[DEBUG]   output[${i}] type: ${item.type}, role: ${item.role}`);
+          if (item.content) {
+            item.content.forEach((c, j) => {
+              console.log(`[DEBUG]     content[${j}] type: ${c.type}, has audio: ${!!c.audio}, text: ${c.text?.substring(0, 100) || '(none)'}`);
+            });
+          }
+        });
+      }
+      if (event.response?.status_details) {
+        console.log(`[DEBUG] response.done - status_details:`, JSON.stringify(event.response.status_details));
+      }
+    }
+    if (event.type === "error") {
+      console.log(`[ERROR] OpenAI error:`, JSON.stringify(event.error));
     }
 
-    // Log important events (skip noisy audio delta)
-    if (event.type !== "response.audio.delta") {
-      console.log(`Relaying "${event.type}" to Client`);
+    // After OUR session update is confirmed with audio modalities, send greeting
+    if (event.type === "session.updated" && !initialGreetingSent) {
+      const mods = event.session?.modalities || [];
+      if (mods.includes("audio")) {
+        initialGreetingSent = true;
+        console.log(`>>> Audio modalities confirmed! Requesting initial greeting...`);
+        
+        // Small delay to ensure session is fully applied
+        setTimeout(() => {
+          client.realtime.send("response.create", {
+            response: {
+              modalities: ["text", "audio"],
+            },
+          });
+          console.log(`>>> Sent response.create for greeting`);
+        }, 500);
+      }
+    }
+
+    // Log non-audio events
+    if (event.type !== "response.audio.delta" && event.type !== "response.audio_transcript.delta") {
+      console.log(`>> To Client: "${event.type}"`);
     }
 
     ws.send(JSON.stringify(event));
@@ -95,47 +131,44 @@ wss.on("connection", async (ws, req) => {
 
   client.realtime.on("close", () => ws.close());
 
-  // Relay: Browser Event -> OpenAI Realtime API Event
+  // ===== Browser -> OpenAI relay =====
   const preConnectQueue = [];
 
   const messageHandler = (data) => {
     try {
       const event = JSON.parse(data);
 
-      // DROP the client's initial session.update, conversation.item.create, response.create
-      // Server handles the entire initial setup
-      if (!clientInitialEventsDone) {
-        if (
-          event.type === "session.update" ||
-          event.type === "conversation.item.create" ||
-          event.type === "response.create"
-        ) {
-          console.log(`Dropping client initial "${event.type}" (server handles this)`);
-
-          // After we see the client's response.create, initial phase is over
+      // DROP all client initial setup events - server handles everything
+      if (!clientInitDone) {
+        if (event.type === "session.update" || event.type === "conversation.item.create" || event.type === "response.create") {
+          console.log(`[DROP] client "${event.type}" (server handles init)`);
           if (event.type === "response.create") {
-            clientInitialEventsDone = true;
-            console.log(`>>> Client initial events phase complete. Now relaying normally.`);
+            clientInitDone = true;
+            console.log(`>>> Client init phase complete`);
           }
           return;
         }
       }
 
-      // For any later session.update from client, force audio + prompt
+      // After init, force audio on any session.update
       if (event.type === "session.update") {
         event.session = event.session || {};
         event.session.modalities = ["text", "audio"];
-        event.session.voice = event.session.voice || "shimmer";
+        event.session.voice = "shimmer";
         event.session.instructions = SYSTEM_PROMPT;
         event.session.input_audio_transcription = { model: "whisper-1" };
         event.session.turn_detection = { type: "server_vad" };
-        console.log(`Forced audio modalities on later client session.update`);
+        console.log(`[FORCE] audio on client session.update`);
+      }
+
+      // Don't log noisy audio events
+      if (event.type !== "input_audio_buffer.append") {
+        console.log(`>> To OpenAI: "${event.type}"`);
       }
 
       client.realtime.send(event.type, event);
     } catch (e) {
-      console.error(e.message);
-      console.log(`Error parsing event from client: ${data}`);
+      console.error(`[ERR] ${e.message}`);
     }
   };
 
@@ -149,7 +182,7 @@ wss.on("connection", async (ws, req) => {
 
   ws.on("close", () => client.disconnect());
 
-  // Connect to OpenAI Realtime API
+  // ===== Connect =====
   try {
     console.log(`Connecting to OpenAI...`);
     await client.connect();
@@ -161,19 +194,33 @@ wss.on("connection", async (ws, req) => {
 
   console.log(`Connected to OpenAI successfully!`);
 
-  // SERVER controls session config - send it immediately
-  client.realtime.send("session.update", {
-    session: {
+  // ===== Server-side session config =====
+  // Use updateSession which is the high-level API
+  try {
+    client.updateSession({
       modalities: ["text", "audio"],
       voice: "shimmer",
       instructions: SYSTEM_PROMPT,
       input_audio_transcription: { model: "whisper-1" },
       turn_detection: { type: "server_vad" },
-    },
-  });
-  console.log(">>> Sent server-side session config with Pharco interviewer prompt");
+    });
+    console.log(">>> Sent session config via client.updateSession()");
+  } catch (e) {
+    // Fallback to raw send
+    console.log(`updateSession failed (${e.message}), trying raw send...`);
+    client.realtime.send("session.update", {
+      session: {
+        modalities: ["text", "audio"],
+        voice: "shimmer",
+        instructions: SYSTEM_PROMPT,
+        input_audio_transcription: { model: "whisper-1" },
+        turn_detection: { type: "server_vad" },
+      },
+    });
+    console.log(">>> Sent session config via raw realtime.send()");
+  }
 
-  // Process any messages that arrived before connection
+  // Process pre-connection queue
   while (preConnectQueue.length) {
     messageHandler(preConnectQueue.shift());
   }
