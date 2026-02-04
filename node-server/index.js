@@ -37,6 +37,36 @@ wss.on("connection", async (ws, req) => {
   let sessionConfigured = false;
   const pendingMessages = [];
 
+  const SYSTEM_PROMPT = `أنت "سارة"، مسؤولة التوظيف الذكية في شركة فاركو للأدوية (Pharco Pharmaceuticals) - واحدة من أكبر شركات الأدوية في مصر.
+
+## دورك:
+أنتِ بتعملي مقابلة شخصية مبدئية (Screening Interview) مع المتقدمين للوظائف في فاركو. هدفك تقيمي المرشح بشكل مهني ولطيف.
+
+## أسلوبك:
+- اتكلمي بالعربي المصري بشكل مهني ولبق
+- كوني ودودة ومحترفة في نفس الوقت
+- لو المرشح اتكلم إنجليزي، ردي بالإنجليزي
+- خلي الأسئلة قصيرة ومباشرة
+- اسمعي كويس واسألي أسئلة متابعة بناءً على إجابات المرشح
+
+## خطوات المقابلة:
+1. **الترحيب**: رحبي بالمرشح وعرفيه إن دي مقابلة مبدئية مع فاركو، وقوليله إن المقابلة هتاخد حوالي 5 دقايق
+2. **التعارف**: اسأليه عن اسمه والوظيفة اللي متقدم ليها
+3. **الخبرة**: اسأليه عن خبرته السابقة وإيه اللي خلاه يتقدم لفاركو
+4. **الأسئلة الفنية**: اسألي 2-3 أسئلة متعلقة بالوظيفة اللي متقدم ليها
+5. **الأسئلة السلوكية**: اسألي سؤال أو اتنين عن مواقف واجهها في الشغل
+6. **أسئلة المرشح**: اسأليه لو عنده أي أسئلة عن فاركو أو الوظيفة
+7. **الختام**: اشكريه على وقته وقوليله إن الفريق هيتواصل معاه خلال أسبوع
+
+## قواعد مهمة:
+- سؤال واحد في كل مرة - ما تسأليش أكتر من سؤال مع بعض
+- لو المرشح خرج عن الموضوع، رجعيه بلطف
+- لو المرشح سألك عن المرتب، قولي إن ده بيتحدد بعد المقابلات النهائية
+- ما تأكديش إنه اتقبل أو اترفض - دي مقابلة مبدئية فقط
+- خلي المقابلة ما تزيدش عن 5 دقايق
+
+ابدأي بالترحيب بالمرشح.`;
+
   // Relay: OpenAI Realtime API Event -> Browser Event
   client.realtime.on("server.*", (event) => {
     // Track when our session config is applied
@@ -66,7 +96,8 @@ wss.on("connection", async (ws, req) => {
       if (event.type === "session.update") {
         event.session = event.session || {};
         event.session.modalities = ["text", "audio"];
-        event.session.voice = event.session.voice || "alloy";
+        event.session.voice = event.session.voice || "shimmer";
+        event.session.instructions = event.session.instructions || SYSTEM_PROMPT;
         event.session.input_audio_transcription = { model: "whisper-1" };
         event.session.turn_detection = { type: "server_vad" };
         console.log(`Forced audio modalities on session.update`);
@@ -111,6 +142,18 @@ wss.on("connection", async (ws, req) => {
   }
 
   console.log(`Connected to OpenAI successfully!`);
+
+  // Send server-side session configuration with system prompt
+  client.realtime.send("session.update", {
+    session: {
+      modalities: ["text", "audio"],
+      voice: "shimmer",
+      instructions: SYSTEM_PROMPT,
+      input_audio_transcription: { model: "whisper-1" },
+      turn_detection: { type: "server_vad" },
+    },
+  });
+  console.log("Sent server-side session config with Pharco interviewer prompt");
 
   // Flush pre-connection queue
   while (messageQueue.length) {
