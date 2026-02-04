@@ -1,16 +1,87 @@
-const messageHandler = (data) => {
+import { WebSocketServer } from "ws";
+import { RealtimeClient } from "@openai/realtime-api-beta";
+import dotenv from "dotenv";
+dotenv.config();
+
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+if (!OPENAI_API_KEY) {
+  console.error(
+    `Environment variable "OPENAI_API_KEY" is required.\n` +
+      `Please set it in your .env file.`
+  );
+  process.exit(1);
+}
+
+const PORT = process.env.PORT || 3000;
+
+const wss = new WebSocketServer({ port: PORT });
+
+wss.on("connection", async (ws, req) => {
+  if (!req.url) {
+    console.log("No URL provided, closing connection.");
+    ws.close();
+    return;
+  }
+
+  const url = new URL(req.url, `https://${req.headers.host}`);
+  const pathname = url.pathname;
+
+  if (pathname !== "/") {
+    console.log(`Invalid pathname: "${pathname}"`);
+    ws.close();
+    return;
+  }
+
+  const client = new RealtimeClient({ apiKey: OPENAI_API_KEY });
+
+  let sessionConfigured = false;
+  const pendingMessages = [];
+
+  // Relay: OpenAI Realtime API Event -> Browser Event
+  client.realtime.on("server.*", (event) => {
+    // Track when our session config is applied
+    if (event.type === "session.updated") {
+      sessionConfigured = true;
+      // Flush any pending messages
+      while (pendingMessages.length) {
+        const pendingEvent = pendingMessages.shift();
+        console.log(`Flushing pending "${pendingEvent.type}" to OpenAI`);
+        client.realtime.send(pendingEvent.type, pendingEvent);
+      }
+    }
+    console.log(`Relaying "${event.type}" to Client`);
+    ws.send(JSON.stringify(event));
+  });
+
+  client.realtime.on("close", () => ws.close());
+
+  // Relay: Browser Event -> OpenAI Realtime API Event
+  const messageQueue = [];
+
+  const messageHandler = (data) => {
     try {
       const event = JSON.parse(data);
-      
-      // Force audio on any session update from client
+
+      // INTERCEPT: Force audio modalities on ALL session updates
       if (event.type === "session.update") {
-        if (event.session) {
-          event.session.modalities = ["text", "audio"];
-          event.session.voice = "alloy";
-        }
-        console.log("Forced audio modalities on session.update");
+        event.session = event.session || {};
+        event.session.modalities = ["text", "audio"];
+        event.session.voice = event.session.voice || "alloy";
+        event.session.input_audio_transcription = { model: "whisper-1" };
+        event.session.turn_detection = { type: "server_vad" };
+        console.log(`Forced audio modalities on session.update`);
+        // Session updates go through immediately
+        client.realtime.send(event.type, event);
+        return;
       }
-      
+
+      // QUEUE: Hold conversation.item.create and response.create until session is ready
+      if (!sessionConfigured && (event.type === "conversation.item.create" || event.type === "response.create")) {
+        console.log(`Queuing "${event.type}" until session is configured`);
+        pendingMessages.push(event);
+        return;
+      }
+
       console.log(`Relaying "${event.type}" to OpenAI`);
       client.realtime.send(event.type, event);
     } catch (e) {
@@ -18,3 +89,33 @@ const messageHandler = (data) => {
       console.log(`Error parsing event from client: ${data}`);
     }
   };
+
+  ws.on("message", (data) => {
+    if (!client.isConnected()) {
+      messageQueue.push(data);
+    } else {
+      messageHandler(data);
+    }
+  });
+
+  ws.on("close", () => client.disconnect());
+
+  // Connect to OpenAI Realtime API
+  try {
+    console.log(`Connecting to OpenAI...`);
+    await client.connect();
+  } catch (e) {
+    console.log(`Error connecting to OpenAI: ${e.message}`);
+    ws.close();
+    return;
+  }
+
+  console.log(`Connected to OpenAI successfully!`);
+
+  // Flush pre-connection queue
+  while (messageQueue.length) {
+    messageHandler(messageQueue.shift());
+  }
+});
+
+console.log(`Websocket server listening on port ${PORT}`);
